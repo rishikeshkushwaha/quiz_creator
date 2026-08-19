@@ -380,6 +380,63 @@ def extract_pages(reader, start_page, end_page):
         keep.append(ln)
     return keep
 
+@st.cache_data(show_spinner=False)
+def load_solved_index():
+    """Extract topic and inclusive printed-page ranges from the PDF index."""
+    reader = PdfReader(SOLVED_PDF)
+    index_lines = []
+    for page_number in (3, 4):
+        if page_number <= len(reader.pages):
+            text = reader.pages[page_number - 1].extract_text() or ""
+            index_lines.extend(text.splitlines())
+
+    entries = []
+    section = ""
+    pending = []
+    range_re = re.compile(r"(\d{1,4})\s*-\s*(\d{1,4})\s*$")
+    section_names = {
+        "Indian Polity and Governance",
+        "Indian History",
+        "General Geography",
+        "General Science",
+        "Indian Economy",
+        "Environment and Ecology",
+        "Current Affairs",
+    }
+
+    for raw_line in index_lines:
+        line = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", raw_line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line or line.isdigit():
+            continue
+        line = re.sub(r"^q\s*", "", line, flags=re.IGNORECASE)
+        line = line.strip()
+
+        if line in section_names:
+            section = line
+            pending = []
+            continue
+
+        pending.append(line)
+        match = range_re.search(line)
+        if not match:
+            continue
+
+        topic = re.sub(r"\s+", " ", " ".join(pending[:-1] + [line[:match.start()]]))
+        topic = topic.strip(" -")
+        if topic:
+            entries.append(
+                {
+                    "Section": section,
+                    "Topic": topic,
+                    "Start page": int(match.group(1)),
+                    "End page": int(match.group(2)),
+                }
+            )
+        pending = []
+
+    return entries
+
 
 @st.cache_data(show_spinner=False)
 def load_solved(start_page, end_page):
@@ -514,7 +571,7 @@ def render_sidebar():
                 else:
                     st.error("Could not parse the uploaded PDF. Please check the format.")
 
-        with st.expander("📜 Load Previous Year Questions (PYQ)", expanded=False):
+        with st.expander("📜 Load Previous Year Questions (PYQ)", expanded=True):
             st.caption(
                 f"Read questions from the solved paper "
                 f"`{os.path.basename(SOLVED_PDF)}` by page range."
@@ -523,6 +580,25 @@ def render_sidebar():
                 _npages = len(PdfReader(SOLVED_PDF).pages)
             except Exception:
                 _npages = 0
+
+            try:
+                index_rows = load_solved_index()
+            except Exception as exc:
+                index_rows = []
+                st.warning(f"Could not read the PDF index: {exc}")
+            if index_rows:
+                st.caption("Index: choose a topic's printed page range for this test or practice session.")
+                st.dataframe(
+                    pd.DataFrame(index_rows),
+                    hide_index=True,
+                    height=420,
+                    use_container_width=True,
+                    column_config={
+                        "Start page": st.column_config.NumberColumn(format="%d"),
+                        "End page": st.column_config.NumberColumn(format="%d"),
+                    },
+                )
+
             c_a, c_b = st.columns(2)
             with c_a:
                 sp = st.number_input("Start page", min_value=1, max_value=max(1, _npages), value=1)
