@@ -6,6 +6,8 @@ import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
 
+import storage_unified as storage
+
 # -----------------------------------------------------------------------------
 # CONSTANTS
 # -----------------------------------------------------------------------------
@@ -55,6 +57,34 @@ def score_params(questions):
     mw = MARKS_WRONG        # 0.4444...
     total = round(n * MARKS_CORRECT)
     return n, mc, mw, total
+
+
+def question_id(q):
+    """Stable identifier for a question, used to link answers across attempts.
+
+    Uses the source PDF basename + question number. For the solved paper the
+    question number is unique within the whole book, so this is stable across
+    page-range selections and retries. For uploaded/test-series PDFs the
+    basename is used as the source key.
+    """
+    src = st.session_state.get("pdf_source") or "unknown"
+    # For the solved paper, use a fixed key so page-range changes don't alter ids.
+    if os.path.basename(SOLVED_PDF).lower() in src.lower():
+        src = "uppsc_preview_2026"
+    else:
+        src = os.path.basename(src)
+    src = re.sub(r"[^A-Za-z0-9]+", "_", src).strip("_").lower()
+    return f"{src}_q{q['num']}"
+
+
+def _topic_for_page(page):
+    """Map a printed page number to a topic using the solved-paper index."""
+    if page is None:
+        return ""
+    for entry in load_solved_index():
+        if entry["Start page"] <= page <= entry["End page"]:
+            return entry["Topic"]
+    return ""
 
 
 # -----------------------------------------------------------------------------
@@ -365,20 +395,22 @@ def load_test_series(path):
 
 
 def extract_pages(reader, start_page, end_page):
-    """Return the raw extracted text for pages [start_page, end_page] (1-based)."""
+    """Return the raw extracted text for pages [start_page, end_page] (1-based).
+
+    Returns a list of (printed_page_number, line) tuples so that each question
+    can later be tagged with its source page and topic.
+    """
     lines = []
     n = len(reader.pages)
     s = max(1, min(int(start_page), n))
     e = max(s, min(int(end_page), n))
     for p in range(s - 1, e):
         text = reader.pages[p].extract_text() or ""
-        lines.append(text)
-    keep = []
-    for ln in "\n".join(lines).split("\n"):
-        if _is_one_liner(ln):
-            continue
-        keep.append(ln)
-    return keep
+        for ln in text.split("\n"):
+            if _is_one_liner(ln):
+                continue
+            lines.append((p + 1, ln))
+    return lines
 
 @st.cache_data(show_spinner=False)
 def load_solved_index():
@@ -440,10 +472,26 @@ def load_solved_index():
 
 @st.cache_data(show_spinner=False)
 def load_solved(start_page, end_page):
-    """Parse the solved-paper PDF over the given inclusive page range."""
+    """Parse the solved-paper PDF over the given inclusive page range.
+
+    Each question is tagged with its printed source page and topic.
+    """
     reader = PdfReader(SOLVED_PDF)
-    lines = extract_pages(reader, start_page, end_page)
-    return parse_solved_lines(lines)
+    page_lines = extract_pages(reader, start_page, end_page)
+    questions = parse_solved_lines([ln for _p, ln in page_lines])
+
+    # Map each question to its source page by locating its number in the
+    # page-annotated line stream.
+    page_by_num = {}
+    for p, ln in page_lines:
+        m = re.match(r"^\s*(\d{1,3})\.\s+", ln)
+        if m:
+            page_by_num.setdefault(int(m.group(1)), p)
+
+    for q in questions:
+        q["source_page"] = page_by_num.get(q["num"])
+        q["topic"] = _topic_for_page(q["source_page"])
+    return questions
 
 
 # -----------------------------------------------------------------------------
@@ -461,25 +509,67 @@ def init_state():
         "pdf_source": "No test series selected",
         "test_series": [],   # [ (label, path), ...] discovered in pdf/
         "mode": MODE_TEST,   # MODE_TEST or MODE_PRACTICE
+        "profile": None,     # dict {id, name} of the active profile
+        "attempt_id": None,  # current persistent attempt id
+        "attempt_type": "original",
+        "start_page": None,
+        "end_page": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 
-def start_test(num_q, shuffle, mode):
+def _question_id_map(questions):
+    """Return {question_id: question} for the current question list."""
+    return {question_id(q): q for q in questions}
+
+
+def start_test(num_q, shuffle, mode, question_ids=None, attempt_type="original",
+               parent_attempt_id=None):
+    """Start a test/practice session and persist it as a new attempt.
+
+    If `question_ids` is provided (resume/retry), those questions are used in
+    the given order instead of the full question list.
+    """
     questions = st.session_state.questions
-    order = list(range(len(questions)))
-    if shuffle:
-        random.shuffle(order)
-    num_q = min(num_q, len(questions))
-    st.session_state.order = order[:num_q]
+    qid_map = _question_id_map(questions)
+
+    if question_ids is None:
+        order = list(range(len(questions)))
+        if shuffle:
+            random.shuffle(order)
+        num_q = min(num_q, len(questions))
+        order = order[:num_q]
+        ordered_qids = [question_id(questions[i]) for i in order]
+    else:
+        # question_ids already in the desired order; map back to indices.
+        ordered_qids = [qid for qid in question_ids if qid in qid_map]
+        order = [questions.index(qid_map[qid]) for qid in ordered_qids]
+
+    st.session_state.order = order
     st.session_state.idx = 0
     st.session_state.selected = None
     st.session_state.responses = {}
     st.session_state.nav_jump = 0
     st.session_state.mode = mode
     st.session_state.started = True
+    st.session_state.attempt_type = attempt_type
+
+    # Persist the attempt (only if a profile is active).
+    if st.session_state.profile:
+        st.session_state.attempt_id = storage.create_attempt(
+            profile_id=st.session_state.profile["id"],
+            source_pdf=st.session_state.pdf_source,
+            mode=mode,
+            question_ids=ordered_qids,
+            start_page=st.session_state.start_page,
+            end_page=st.session_state.end_page,
+            attempt_type=attempt_type,
+            parent_attempt_id=parent_attempt_id,
+        )
+    else:
+        st.session_state.attempt_id = None
 
 
 # -----------------------------------------------------------------------------
@@ -514,10 +604,97 @@ def reset_app():
 # -----------------------------------------------------------------------------
 # UI: SIDEBAR
 # -----------------------------------------------------------------------------
+def _render_profile_section():
+    """Profile selection / creation and unfinished-session resume."""
+    profiles = storage.list_profiles()
+    names = [p["name"] for p in profiles]
+
+    st.caption("**👤 Profile**")
+    if st.session_state.profile:
+        st.success(f"Signed in as **{st.session_state.profile['name']}**")
+        if st.button("Sign out", use_container_width=True, key="btn_sign_out"):
+            st.session_state.profile = None
+            st.session_state.attempt_id = None
+            st.rerun()
+    else:
+        if names:
+            sel = st.selectbox("Select profile", names, key="profile_sel")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Use", use_container_width=True, key="btn_use_profile"):
+                    st.session_state.profile = next(
+                        p for p in profiles if p["name"] == sel
+                    )
+                    st.rerun()
+            with c2:
+                st.caption("or create:")
+        new_name = st.text_input("New profile name", key="profile_new")
+        if st.button("➕ Create profile", use_container_width=True, 
+                       disabled=not new_name.strip(), key="btn_create_profile"):
+            try:
+                st.session_state.profile = storage.get_or_create_profile(new_name)
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+    # Resume unfinished attempts for the active profile.
+    if st.session_state.profile:
+        unfinished = storage.list_unfinished_attempts(st.session_state.profile["id"])
+        if unfinished:
+            st.divider()
+            st.caption("**⏳ Resume unfinished session**")
+            labels = [
+                f"{a['source_pdf']} · {a['mode']} · {a['question_count']} Q"
+                for a in unfinished
+            ]
+            pick = st.selectbox("Unfinished sessions", labels, key="resume_sel")
+            if st.button("▶️ Resume", use_container_width=True, key="btn_resume"):
+                _resume_attempt(unfinished[labels.index(pick)])
+
+
+def _resume_attempt(attempt):
+    """Restore an in-progress attempt into session state."""
+    qid_map = _question_id_map(st.session_state.questions or [])
+    ordered_qids = storage.get_attempt_question_ids(attempt["id"])
+    answers = storage.get_attempt_answers(attempt["id"])
+
+    # Rebuild order and responses from stored question ids.
+    order = []
+    responses = {}
+    for pos, qid in enumerate(ordered_qids):
+        q = qid_map.get(qid)
+        if q is None:
+            continue
+        order.append(st.session_state.questions.index(q))
+        ans = answers.get(qid)
+        if ans:
+            responses[pos] = {
+                "question": q["question"],
+                "user": ans["selected_answer"],
+                "correct": ans["correct_answer"],
+                "status": ans["status"],
+            }
+
+    st.session_state.order = order
+    st.session_state.responses = responses
+    st.session_state.idx = 0
+    st.session_state.selected = None
+    st.session_state.nav_jump = 0
+    st.session_state.mode = attempt["mode"]
+    st.session_state.started = True
+    st.session_state.attempt_id = attempt["id"]
+    st.session_state.attempt_type = attempt["attempt_type"]
+    st.session_state.start_page = attempt["start_page"]
+    st.session_state.end_page = attempt["end_page"]
+    st.rerun()
+
+
 def render_sidebar():
     n_total = len(st.session_state.questions) if st.session_state.questions else 0
     with st.sidebar:
         st.header("⚙️ Test Settings")
+
+        _render_profile_section()
 
         st.caption("**Select a Test Series PDF**")
         if not st.session_state.test_series:
@@ -530,19 +707,22 @@ def render_sidebar():
                 format_func=lambda i: labels[i],
                 key="ts_sel",
             )
-            if st.button("📂 Load Selected PDF", use_container_width=True):
+            if st.button("📂 Load Selected PDF", use_container_width=True, key="btn_load_selected_pdf"):
                 label, path = st.session_state.test_series[idx]
                 with st.spinner(f"Parsing {label}..."):
                     qs = load_test_series(path)
                 if qs:
                     st.session_state.questions = qs
                     st.session_state.pdf_source = label
+                    st.session_state.start_page = None
+                    st.session_state.end_page = None
                     st.session_state.order = None
                     st.session_state.idx = 0
                     st.session_state.started = False
                     st.session_state.selected = None
                     st.session_state.responses = {}
                     st.session_state.nav_jump = 0
+                    st.session_state.attempt_id = None
                     st.session_state.pop("slider_num_q", None)
                     st.rerun()
                 else:
@@ -554,18 +734,21 @@ def render_sidebar():
                 "(`1 (c) 2 (d) ...`) and/or solved-style `Ans.` + explanation blocks."
             )
             up_file = st.file_uploader("Test-series PDF", type=["pdf"], key="up_pdf")
-            if st.button("📂 Load Uploaded PDF", use_container_width=True, disabled=(up_file is None)):
+            if st.button("📂 Load Uploaded PDF", use_container_width=True, disabled=(up_file is None), key="btn_load_uploaded_pdf"):
                 with st.spinner("Parsing the uploaded PDF..."):
                     qs = load_test_series_bytes(up_file.getvalue())
                 if qs:
                     st.session_state.questions = qs
                     st.session_state.pdf_source = up_file.name
+                    st.session_state.start_page = None
+                    st.session_state.end_page = None
                     st.session_state.order = None
                     st.session_state.idx = 0
                     st.session_state.started = False
                     st.session_state.selected = None
                     st.session_state.responses = {}
                     st.session_state.nav_jump = 0
+                    st.session_state.attempt_id = None
                     st.session_state.pop("slider_num_q", None)
                     st.rerun()
                 else:
@@ -610,12 +793,15 @@ def render_sidebar():
                 if qs:
                     st.session_state.questions = qs
                     st.session_state.pdf_source = f"PYQ pages {sp}-{ep} ({os.path.basename(SOLVED_PDF)})"
+                    st.session_state.start_page = int(sp)
+                    st.session_state.end_page = int(ep)
                     st.session_state.order = None
                     st.session_state.idx = 0
                     st.session_state.started = False
                     st.session_state.selected = None
                     st.session_state.responses = {}
                     st.session_state.nav_jump = 0
+                    st.session_state.attempt_id = None
                     st.session_state.pop("slider_num_q", None)
                     st.rerun()
                 else:
@@ -659,7 +845,7 @@ def render_sidebar():
                 st.session_state.setdefault("slider_num_q", n_total)
             st.checkbox("Shuffle question order", value=False, key="chk_shuffle")
             st.divider()
-        if st.button("🔄 Reset / New Test", use_container_width=True):
+        if st.button("🔄 Reset / New Test", use_container_width=True, key="btn_reset_test"):
             reset_app()
 
 
@@ -683,6 +869,48 @@ def load_test_series_bytes(pdf_bytes: bytes):
 # -----------------------------------------------------------------------------
 # UI: INTRO SCREEN
 # -----------------------------------------------------------------------------
+def _render_dashboard():
+    """Show profile stats and recent attempt history."""
+    if not st.session_state.profile:
+        return
+    profile = st.session_state.profile
+    stats = storage.get_profile_stats(profile["id"])
+    completed = storage.list_completed_attempts(profile["id"], limit=20)
+
+    st.divider()
+    st.subheader(f"📊 Progress — {profile['name']}")
+
+    if stats["total_attempts"] == 0:
+        st.info("No completed attempts yet. Start a test to begin tracking progress.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Attempts", stats["total_attempts"])
+    c2.metric("Test Mode", stats["test_attempts"] or 0)
+    c3.metric("Practice Mode", stats["practice_attempts"] or 0)
+    c4.metric("Accuracy", f"{stats['accuracy']:.1f}%")
+
+    if completed:
+        st.caption("**Recent attempts**")
+        rows = []
+        for a in completed:
+            # Calculate accuracy for this attempt
+            ans = storage.get_attempt_answers(a["id"])
+            correct = sum(1 for v in ans.values() if v["status"] == "Correct")
+            wrong = sum(1 for v in ans.values() if v["status"] == "Wrong")
+            attempted = correct + wrong
+            acc = (correct / attempted * 100) if attempted else 0.0
+            rows.append({
+                "Source": a["source_pdf"],
+                "Mode": a["mode"],
+                "Type": a["attempt_type"],
+                "Questions": a["question_count"],
+                "Accuracy": f"{acc:.1f}%",
+                "Completed": (a["completed_at"] or "")[:16].replace("T", " "),
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
 def render_intro():
     st.title(f"📚 {PAGE_TITLE}")
     st.subheader("Practice Test Series - 2026 · General Studies-I (English Version)")
@@ -695,6 +923,7 @@ def render_intro():
             "Select a test-series PDF from the **sidebar** (or upload your own) "
             "to load questions, then press Start."
         )
+        _render_dashboard()
         return
 
     mode_desc = (
@@ -722,13 +951,15 @@ def render_intro():
 
     st.divider()
     st.info("Configure the number of questions, mode & shuffling in the **sidebar**, then press Start.")
-    if st.button("🚀 Start Test", type="primary", use_container_width=True):
+    if st.button("🚀 Start Test", type="primary", use_container_width=True, key="btn_start_test"):
         start_test(
             num_q=st.session_state.slider_num_q,
             shuffle=st.session_state.chk_shuffle,
             mode=st.session_state.mode_choice,
         )
         st.rerun()
+
+    _render_dashboard()
 
 
 # -----------------------------------------------------------------------------
@@ -740,7 +971,7 @@ def render_quiz():
     total = len(order)
     idx = st.session_state.idx
 
-    if idx < total:
+    if int(idx) < total:
         _render_question(questions, order, idx, total)
     else:
         _render_results(questions, order, total)
@@ -836,12 +1067,22 @@ def _render_question(questions, order, idx, total):
                 if sel is None:
                     st.warning("Please select an option first.")
                 else:
+                    status = "Correct" if sel == q["answer"] else "Wrong"
                     responses[idx] = {
                         "question": q["question"],
                         "user": sel,
                         "correct": q["answer"],
-                        "status": "Correct" if sel == q["answer"] else "Wrong",
+                        "status": status,
                     }
+                    # Persist the answer if an attempt is active.
+                    if st.session_state.attempt_id:
+                        storage.save_answer(
+                            attempt_id=st.session_state.attempt_id,
+                            question_id=question_id(q),
+                            selected_answer=sel,
+                            correct_answer=q["answer"],
+                            status=status,
+                        )
                     st.rerun()
         with colB:
             st.button(
@@ -900,6 +1141,10 @@ def _render_results(questions, order, total):
     st.balloons()
     st.title("🏁 Test Complete")
 
+    # Mark the attempt complete once (idempotent).
+    if st.session_state.attempt_id:
+        storage.complete_attempt(st.session_state.attempt_id)
+
     responses = st.session_state.responses
     correct = sum(1 for r in responses.values() if r["status"] == "Correct")
     wrong = sum(1 for r in responses.values() if r["status"] == "Wrong")
@@ -926,6 +1171,33 @@ def _render_results(questions, order, total):
         st.error("Needs more practice ❗")
 
     st.divider()
+
+    # --- Retry options -----------------------------------------------------
+    if st.session_state.profile and st.session_state.attempt_id:
+        st.subheader("🔁 Re-attempt")
+        wrong_ids = storage.get_wrong_question_ids(st.session_state.attempt_id)
+        skipped_ids = storage.get_skipped_question_ids(st.session_state.attempt_id)
+        unmastered_ids = storage.get_unmastered_question_ids(st.session_state.attempt_id)
+        all_ids = storage.get_attempt_question_ids(st.session_state.attempt_id)
+
+        r1, r2, r3, r4 = st.columns(4)
+        with r1:
+            if st.button(f"❌ Wrong ({len(wrong_ids)})", use_container_width=True,
+                         disabled=not wrong_ids, key="btn_retry_wrong"):
+                _start_retry(wrong_ids, "retry_wrong")
+        with r2:
+            if st.button(f"⏭️ Skipped ({len(skipped_ids)})", use_container_width=True,
+                         disabled=not skipped_ids, key="btn_retry_skipped"):
+                _start_retry(skipped_ids, "retry_skipped")
+        with r3:
+            if st.button(f"⚠️ Wrong+Skipped ({len(unmastered_ids)})",
+                         use_container_width=True, disabled=not unmastered_ids, key="btn_retry_unmastered"):
+                _start_retry(unmastered_ids, "retry_unmastered")
+        with r4:
+            if st.button(f"🔁 Full test ({len(all_ids)})", use_container_width=True, key="btn_retry_full"):
+                _start_retry(all_ids, "retry_full")
+        st.divider()
+
     st.subheader("🔍 Jump Back Into The Test")
     jump = st.selectbox(
         "Select a question to review / re-open:",
@@ -939,7 +1211,7 @@ def _render_results(questions, order, total):
         st.session_state.selected = None
         st.session_state.nav_jump = st.session_state.review_jump
 
-    st.button("📖 Open Selected Question", use_container_width=True, on_click=_open_review)
+    st.button("📖 Open Selected Question", use_container_width=True, on_click=_open_review, key="btn_open_review")
 
     st.divider()
     st.subheader("📋 Detailed Review")
@@ -951,6 +1223,7 @@ def _render_results(questions, order, total):
         if r is None:
             rows.append({
                 "Q#": q["num"],
+                "Topic": q.get("topic", ""),
                 "Question": q["question"],
                 "Your Answer": "—",
                 "Correct Answer": f"({q['answer'].upper()})",
@@ -959,6 +1232,7 @@ def _render_results(questions, order, total):
         else:
             rows.append({
                 "Q#": q["num"],
+                "Topic": q.get("topic", ""),
                 "Question": r["question"],
                 "Your Answer": f"({r['user'].upper()})",
                 "Correct Answer": f"({r['correct'].upper()})",
@@ -975,13 +1249,38 @@ def _render_results(questions, order, total):
         mime="text/csv",
     )
 
-    if st.button("🔁 Restart Test", type="primary"):
+    if st.button("🔁 Restart Test", type="primary", key="btn_restart_test"):
         start_test(
             num_q=st.session_state.slider_num_q,
             shuffle=st.session_state.chk_shuffle,
             mode=st.session_state.mode,
         )
         st.rerun()
+
+    if st.button("🏠 Return to Dashboard", use_container_width=True, key="btn_return_dashboard"):
+        # Reset test state but keep profile and questions loaded
+        st.session_state.started = False
+        st.session_state.order = None
+        st.session_state.idx = 0
+        st.session_state.selected = None
+        st.session_state.responses = {}
+        st.session_state.nav_jump = 0
+        st.session_state.attempt_id = None
+        st.session_state.attempt_type = "original"
+        st.rerun()
+
+
+def _start_retry(question_ids, retry_type):
+    """Start a new attempt containing only the given question ids."""
+    start_test(
+        num_q=len(question_ids),
+        shuffle=False,
+        mode=st.session_state.mode,
+        question_ids=question_ids,
+        attempt_type=retry_type,
+        parent_attempt_id=st.session_state.attempt_id,
+    )
+    st.rerun()
 
 
 # -----------------------------------------------------------------------------
@@ -998,6 +1297,7 @@ def main():
         unsafe_allow_html=True,
     )
     init_state()
+    storage.init_db()
 
     # Discover test-series PDFs on first run
     if st.session_state.questions is None and not st.session_state.test_series:
