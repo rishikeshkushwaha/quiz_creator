@@ -1,0 +1,10 @@
+quiz_progress.db
+*.db
+*.xlsx
+*.ipynb
+.vscode/
+.devcontainer/
+__pycache__/
+.env
+*.pdf
+*.txt
