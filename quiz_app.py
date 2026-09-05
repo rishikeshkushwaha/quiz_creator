@@ -1377,9 +1377,6 @@ def _render_question(questions, order, idx, total):
 
     default = saved["user"] if (saved and saved["user"] in opt_keys) else None
 
-    def on_change():
-        st.session_state.selected = st.session_state[f"radio_{idx}"]
-
     st.radio(
         "Choose the correct option:",
         options=opt_keys,
@@ -1387,34 +1384,36 @@ def _render_question(questions, order, idx, total):
         key=f"radio_{idx}",
         index=opt_keys.index(default) if default else None,
         disabled=submitted,
-        on_change=on_change,
     )
 
     if not submitted:
         colA, colB, _ = st.columns([1, 1, 4])
         with colA:
-            if st.button("✅ Submit Answer", use_container_width=True, type="primary"):
-                sel = st.session_state.selected
+            def _submit_answer():
+                sel = st.session_state[f"radio_{idx}"]
                 if sel is None:
                     st.warning("Please select an option first.")
-                else:
-                    status = "Correct" if sel == q["answer"] else "Wrong"
-                    responses[idx] = {
-                        "question": q["question"],
-                        "user": sel,
-                        "correct": q["answer"],
-                        "status": status,
-                    }
-                    # Persist the answer if an attempt is active.
-                    if st.session_state.attempt_id:
-                        storage.save_answer(
-                            attempt_id=st.session_state.attempt_id,
-                            question_id=question_id(q),
-                            selected_answer=sel,
-                            correct_answer=q["answer"],
-                            status=status,
-                        )
-                    st.rerun()
+                    return
+                status = "Correct" if sel == q["answer"] else "Wrong"
+                responses[idx] = {
+                    "question": q["question"],
+                    "user": sel,
+                    "correct": q["answer"],
+                    "status": status,
+                }
+                # Persist the answer if an attempt is active.
+                if st.session_state.attempt_id:
+                    storage.save_answer(
+                        attempt_id=st.session_state.attempt_id,
+                        question_id=question_id(q),
+                        selected_answer=sel,
+                        correct_answer=q["answer"],
+                        status=status,
+                    )
+                # No explicit st.rerun() needed - button click triggers rerun
+
+            st.button("✅ Submit Answer", use_container_width=True, type="primary", 
+                      on_click=_submit_answer, key=f"btn_submit_{idx}")
         with colB:
             st.button(
                 "⏭️ Skip Question",
