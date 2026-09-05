@@ -1,6 +1,8 @@
 import os
 import re
 import random
+import json
+from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
@@ -24,6 +26,7 @@ PAGE_TITLE = "UP-PCS Prelims 2026 Practice Hub"
 # Modes of the exam
 MODE_TEST = "Test Mode"
 MODE_PRACTICE = "Practice Mode"
+MODE_SIMULATION = "Simulation Mode"
 
 # Regexes used by the single-file test-series parser.
 # Matches the start of a solved-style question block: a number at the start of a
@@ -494,6 +497,64 @@ def load_solved(start_page, end_page):
     return questions
 
 
+@st.cache_data(show_spinner=False)
+def load_solved_by_topics(selected_topics):
+    """Parse the solved-paper PDF for specific topics.
+
+    Args:
+        selected_topics: List of topic names to include
+
+    Returns:
+        List of question dicts for the selected topics
+    """
+    if not selected_topics:
+        return []
+
+    # Get page ranges for selected topics
+    index_entries = load_solved_index()
+    topic_ranges = []
+    for entry in index_entries:
+        if entry["Topic"] in selected_topics:
+            topic_ranges.append((entry["Start page"], entry["End page"]))
+
+    if not topic_ranges:
+        return []
+
+    # Merge overlapping/adjacent ranges
+    topic_ranges.sort()
+    merged = []
+    for start, end in topic_ranges:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    # Load questions from merged ranges
+    all_questions = []
+    for start, end in merged:
+        qs = load_solved(start, end)
+        # Filter to only include questions from selected topics
+        for q in qs:
+            if q.get("topic") in selected_topics:
+                all_questions.append(q)
+
+    return all_questions
+
+
+def get_available_sections_and_topics():
+    """Get organized sections and topics from the index."""
+    index_entries = load_solved_index()
+    sections = {}
+    for entry in index_entries:
+        section = entry["Section"]
+        topic = entry["Topic"]
+        if section not in sections:
+            sections[section] = []
+        if topic not in sections[section]:
+            sections[section].append(topic)
+    return sections
+
+
 # -----------------------------------------------------------------------------
 # SESSION STATE HELPERS
 # -----------------------------------------------------------------------------
@@ -537,10 +598,12 @@ def start_test(num_q, shuffle, mode, question_ids=None, attempt_type="original",
 
     if question_ids is None:
         order = list(range(len(questions)))
-        if shuffle:
+        if shuffle and mode != MODE_SIMULATION:
             random.shuffle(order)
-        num_q = min(num_q, len(questions))
-        order = order[:num_q]
+        # In Simulation Mode, use all questions (already filtered by topic)
+        if mode != MODE_SIMULATION:
+            num_q = min(num_q, len(questions))
+            order = order[:num_q]
         ordered_qids = [question_id(questions[i]) for i in order]
     else:
         # question_ids already in the desired order; map back to indices.
@@ -654,7 +717,40 @@ def _render_profile_section():
 
 def _resume_attempt(attempt):
     """Restore an in-progress attempt into session state."""
-    qid_map = _question_id_map(st.session_state.questions or [])
+    # First, reload the questions from the PDF using stored metadata
+    source_pdf = attempt["source_pdf"]
+    start_page = attempt["start_page"]
+    end_page = attempt["end_page"]
+    mode = attempt["mode"]
+
+    # Load questions based on source
+    if "PYQ pages" in source_pdf and start_page and end_page:
+        # PYQ solved paper
+        qs = load_solved(int(start_page), int(end_page))
+    else:
+        # Test series PDF - find the path
+        pdf_path = None
+        for label, path in st.session_state.test_series:
+            if label == source_pdf or source_pdf in label or label in source_pdf:
+                pdf_path = path
+                break
+        if pdf_path:
+            qs = load_test_series(pdf_path)
+        else:
+            st.error(f"Could not find PDF for: {source_pdf}")
+            return
+
+    if not qs:
+        st.error("Failed to reload questions from PDF")
+        return
+
+    st.session_state.questions = qs
+    st.session_state.pdf_source = source_pdf
+    st.session_state.start_page = start_page
+    st.session_state.end_page = end_page
+
+    # Now map stored question IDs to current questions
+    qid_map = _question_id_map(qs)
     ordered_qids = storage.get_attempt_question_ids(attempt["id"])
     answers = storage.get_attempt_answers(attempt["id"])
 
@@ -665,7 +761,7 @@ def _resume_attempt(attempt):
         q = qid_map.get(qid)
         if q is None:
             continue
-        order.append(st.session_state.questions.index(q))
+        order.append(qs.index(q))
         ans = answers.get(qid)
         if ans:
             responses[pos] = {
@@ -680,12 +776,10 @@ def _resume_attempt(attempt):
     st.session_state.idx = 0
     st.session_state.selected = None
     st.session_state.nav_jump = 0
-    st.session_state.mode = attempt["mode"]
+    st.session_state.mode = mode
     st.session_state.started = True
     st.session_state.attempt_id = attempt["id"]
     st.session_state.attempt_type = attempt["attempt_type"]
-    st.session_state.start_page = attempt["start_page"]
-    st.session_state.end_page = attempt["end_page"]
     st.rerun()
 
 
@@ -757,66 +851,181 @@ def render_sidebar():
         with st.expander("📜 Load Previous Year Questions (PYQ)", expanded=True):
             st.caption(
                 f"Read questions from the solved paper "
-                f"`{os.path.basename(SOLVED_PDF)}` by page range."
+                f"`{os.path.basename(SOLVED_PDF)}` by topic or page range."
             )
-            try:
-                _npages = len(PdfReader(SOLVED_PDF).pages)
-            except Exception:
-                _npages = 0
 
             try:
                 index_rows = load_solved_index()
             except Exception as exc:
                 index_rows = []
                 st.warning(f"Could not read the PDF index: {exc}")
+
             if index_rows:
-                st.caption("Index: choose a topic's printed page range for this test or practice session.")
-                st.dataframe(
-                    pd.DataFrame(index_rows),
-                    hide_index=True,
-                    height=420,
-                    use_container_width=True,
-                    column_config={
-                        "Start page": st.column_config.NumberColumn(format="%d"),
-                        "End page": st.column_config.NumberColumn(format="%d"),
-                    },
+                # Get organized sections and topics
+                sections = get_available_sections_and_topics()
+
+                # Mode selection: Topic-based or Page Range
+                pyq_mode = st.radio(
+                    "Selection Mode",
+                    options=["📚 Topic Selection", "📄 Page Range"],
+                    key="pyq_mode_radio",
+                    horizontal=True,
                 )
 
-            c_a, c_b = st.columns(2)
-            with c_a:
-                sp = st.number_input("Start page", min_value=1, max_value=max(1, _npages), value=1)
-            with c_b:
-                ep = st.number_input("End page", min_value=1, max_value=max(1, _npages), value=min(_npages, 5))
-            if st.button("📂 Load PYQ Pages", use_container_width=True):
-                with st.spinner("Parsing solved paper pages..."):
-                    qs = load_solved(int(sp), int(ep))
-                if qs:
-                    st.session_state.questions = qs
-                    st.session_state.pdf_source = f"PYQ pages {sp}-{ep} ({os.path.basename(SOLVED_PDF)})"
-                    st.session_state.start_page = int(sp)
-                    st.session_state.end_page = int(ep)
-                    st.session_state.order = None
-                    st.session_state.idx = 0
-                    st.session_state.started = False
-                    st.session_state.selected = None
-                    st.session_state.responses = {}
-                    st.session_state.nav_jump = 0
-                    st.session_state.attempt_id = None
-                    st.session_state.pop("slider_num_q", None)
-                    st.rerun()
-                else:
-                    st.error("No questions found in that page range. Try a different range.")
+                if pyq_mode == "📚 Topic Selection":
+                    # Multi-select for sections (subjects)
+                    section_names = list(sections.keys())
+                    selected_sections = st.multiselect(
+                        "Select Subjects/Sections",
+                        options=section_names,
+                        default=section_names[:2] if len(section_names) >= 2 else section_names,
+                        key="pyq_sections_sel",
+                    )
+
+                    # Collect all topics from selected sections
+                    all_topics = []
+                    for sec in selected_sections:
+                        all_topics.extend(sections[sec])
+
+                    # Topic multiselect
+                    selected_topics = st.multiselect(
+                        "Select Topics",
+                        options=all_topics,
+                        default=all_topics[:5] if len(all_topics) >= 5 else all_topics,
+                        key="pyq_topics_sel",
+                    )
+
+                    # Show topic page ranges
+                    if selected_topics:
+                        topic_ranges = []
+                        for entry in index_rows:
+                            if entry["Topic"] in selected_topics:
+                                topic_ranges.append({
+                                    "Topic": entry["Topic"],
+                                    "Section": entry["Section"],
+                                    "Start Page": entry["Start page"],
+                                    "End Page": entry["End page"],
+                                })
+                        st.dataframe(
+                            pd.DataFrame(topic_ranges),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+                        # Random question count option
+                        total_available = 0
+                        for entry in index_rows:
+                            if entry["Topic"] in selected_topics:
+                                total_available += entry["End page"] - entry["Start page"] + 1
+                        # Estimate questions (rough: ~3-5 questions per page)
+                        est_questions = total_available * 4
+
+                        use_random = st.checkbox(
+                            f"🎲 Randomly select N questions (est. ~{est_questions} available)",
+                            value=False,
+                            key="pyq_use_random",
+                        )
+                        if use_random:
+                            random_n = st.number_input(
+                                "Number of questions to randomly select",
+                                min_value=1,
+                                max_value=max(1, est_questions),
+                                value=min(20, est_questions),
+                                step=5,
+                                key="pyq_random_n",
+                            )
+                        else:
+                            random_n = None
+
+                    if st.button("📂 Load PYQ Topics", use_container_width=True, disabled=not selected_topics):
+                        with st.spinner("Parsing solved paper topics..."):
+                            qs = load_solved_by_topics(selected_topics)
+                        if qs:
+                            # Apply random selection if requested
+                            if use_random and random_n and len(qs) > random_n:
+                                random.shuffle(qs)
+                                qs = qs[:random_n]
+                            st.session_state.questions = qs
+                            st.session_state.pdf_source = f"PYQ: {', '.join(selected_sections)} - {len(selected_topics)} topics"
+                            if use_random:
+                                st.session_state.pdf_source += f" (random {random_n})"
+                            st.session_state.start_page = None
+                            st.session_state.end_page = None
+                            st.session_state.order = None
+                            st.session_state.idx = 0
+                            st.session_state.started = False
+                            st.session_state.selected = None
+                            st.session_state.responses = {}
+                            st.session_state.nav_jump = 0
+                            st.session_state.attempt_id = None
+                            st.session_state.pop("slider_num_q", None)
+                            st.rerun()
+                        else:
+                            st.error("No questions found for selected topics. Try different topics.")
+
+                else:  # Page Range mode
+                    try:
+                        _npages = len(PdfReader(SOLVED_PDF).pages)
+                    except Exception:
+                        _npages = 0
+
+                    st.caption("Select page range directly:")
+                    c_a, c_b = st.columns(2)
+                    with c_a:
+                        sp = st.number_input("Start page", min_value=1, max_value=max(1, _npages), value=1, key="pyq_page_start")
+                    with c_b:
+                        ep = st.number_input("End page", min_value=1, max_value=max(1, _npages), value=min(_npages, 5), key="pyq_page_end")
+
+                    # Show which topics fall in this range
+                    if sp <= ep:
+                        range_topics = []
+                        for entry in index_rows:
+                            if not (entry["End page"] < sp or entry["Start page"] > ep):
+                                range_topics.append({
+                                    "Topic": entry["Topic"],
+                                    "Section": entry["Section"],
+                                    "Start Page": entry["Start page"],
+                                    "End Page": entry["End page"],
+                                })
+                        if range_topics:
+                            st.caption("Topics in this range:")
+                            st.dataframe(
+                                pd.DataFrame(range_topics),
+                                hide_index=True,
+                                use_container_width=True,
+                            )
+
+                    if st.button("📂 Load PYQ Pages", use_container_width=True):
+                        with st.spinner("Parsing solved paper pages..."):
+                            qs = load_solved(int(sp), int(ep))
+                        if qs:
+                            st.session_state.questions = qs
+                            st.session_state.pdf_source = f"PYQ pages {sp}-{ep} ({os.path.basename(SOLVED_PDF)})"
+                            st.session_state.start_page = int(sp)
+                            st.session_state.end_page = int(ep)
+                            st.session_state.order = None
+                            st.session_state.idx = 0
+                            st.session_state.started = False
+                            st.session_state.selected = None
+                            st.session_state.responses = {}
+                            st.session_state.nav_jump = 0
+                            st.session_state.attempt_id = None
+                            st.session_state.pop("slider_num_q", None)
+                            st.rerun()
+                        else:
+                            st.error("No questions found in that page range. Try a different range.")
 
         if st.session_state.questions:
             st.divider()
             st.caption("**Mode**")
             st.radio(
                 "Choose exam mode:",
-                options=[MODE_TEST, MODE_PRACTICE],
+                options=[MODE_TEST, MODE_PRACTICE, MODE_SIMULATION],
                 key="mode_choice",
                 help=(
                     f"**{MODE_TEST}:** answers are revealed only after the test is complete. "
-                    f"**{MODE_PRACTICE}:** answers are revealed immediately after each submission."
+                    f"**{MODE_PRACTICE}:** answers are revealed immediately after each submission. "
+                    f"**{MODE_SIMULATION}:** topic-based test with mixed questions from selected subjects."
                 ),
             )
             st.divider()
@@ -831,19 +1040,25 @@ def render_sidebar():
         st.divider()
 
         if st.session_state.questions:
-            if n_total > 1:
-                step = 5 if n_total >= 10 else 1
-                st.slider(
-                    "Number of questions",
-                    min_value=1,
-                    max_value=n_total,
-                    value=n_total,
-                    step=step,
-                    key="slider_num_q",
-                )
+            # In Simulation Mode, all questions are used (no slider needed)
+            if st.session_state.mode_choice != MODE_SIMULATION:
+                if n_total > 1:
+                    step = 5 if n_total >= 10 else 1
+                    st.slider(
+                        "Number of questions",
+                        min_value=1,
+                        max_value=n_total,
+                        value=n_total,
+                        step=step,
+                        key="slider_num_q",
+                    )
+                else:
+                    st.session_state.setdefault("slider_num_q", n_total)
+                st.checkbox("Shuffle question order", value=False, key="chk_shuffle")
             else:
+                st.caption(f"📝 Simulation Mode: Using all {n_total} questions from selected topics")
                 st.session_state.setdefault("slider_num_q", n_total)
-            st.checkbox("Shuffle question order", value=False, key="chk_shuffle")
+                st.session_state.setdefault("chk_shuffle", False)
             st.divider()
         if st.button("🔄 Reset / New Test", use_container_width=True, key="btn_reset_test"):
             reset_app()
@@ -910,6 +1125,120 @@ def _render_dashboard():
             })
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
+    # --- Export / Import Progress ---
+    st.divider()
+    st.caption("**📥📤 Sync Progress**")
+    exp_col, imp_col = st.columns(2)
+
+    with exp_col:
+        if st.button("📤 Export Progress (JSON)", use_container_width=True, key="btn_export_progress"):
+            export_data = _export_profile_progress(profile["id"])
+            st.download_button(
+                "⬇️ Download Progress File",
+                data=json.dumps(export_data, indent=2),
+                file_name=f"progress_{profile['name']}_{datetime.now().strftime('%Y%m%d')}.json",
+                mime="application/json",
+                use_container_width=True,
+                key="btn_download_export"
+            )
+
+    with imp_col:
+        uploaded = st.file_uploader("📥 Import Progress", type=["json"], key="progress_import")
+        if uploaded and st.button("📥 Import Progress", use_container_width=True, key="btn_import_progress"):
+            try:
+                import_data = json.load(uploaded)
+                _import_profile_progress(profile["id"], import_data)
+                st.success("Progress imported successfully!")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Import failed: {exc}")
+
+
+def _export_profile_progress(profile_id):
+    """Export all profile data (attempts, answers) as a JSON-serializable dict."""
+    attempts = storage.list_completed_attempts(profile_id, limit=1000)
+    unfinished = storage.list_unfinished_attempts(profile_id)
+
+    all_attempts = attempts + unfinished
+    export_data = {
+        "profile_id": profile_id,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "attempts": []
+    }
+
+    for attempt in all_attempts:
+        answers = storage.get_attempt_answers(attempt["id"])
+        question_ids = storage.get_attempt_question_ids(attempt["id"])
+        attempt_data = dict(attempt)
+        attempt_data["answers"] = [dict(a) for a in answers.values()]
+        attempt_data["question_ids"] = question_ids
+        export_data["attempts"].append(attempt_data)
+
+    return export_data
+
+
+def _import_profile_progress(profile_id, import_data):
+    """Import progress data from a JSON export."""
+    if "attempts" not in import_data:
+        raise ValueError("Invalid export file format")
+
+    imported = 0
+    for attempt_data in import_data["attempts"]:
+        # Skip if attempt already exists (by ID)
+        existing = storage.get_attempt(attempt_data["id"])
+        if existing:
+            continue
+
+        # Create attempt
+        question_ids = attempt_data.get("question_ids", [])
+        storage.create_attempt(
+            profile_id=profile_id,
+            source_pdf=attempt_data["source_pdf"],
+            mode=attempt_data["mode"],
+            question_ids=question_ids,
+            start_page=attempt_data.get("start_page"),
+            end_page=attempt_data.get("end_page"),
+            attempt_type=attempt_data.get("attempt_type", "original"),
+            parent_attempt_id=attempt_data.get("parent_attempt_id"),
+        )
+
+        # Update attempt with original timestamps and status
+        with storage._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE attempts SET 
+                       started_at = %s, completed_at = %s, status = %s, question_count = %s
+                       WHERE id = %s""",
+                    (
+                        attempt_data.get("started_at"),
+                        attempt_data.get("completed_at"),
+                        attempt_data.get("status", "completed"),
+                        attempt_data.get("question_count", len(question_ids)),
+                        attempt_data["id"],
+                    ),
+                )
+
+        # Import answers
+        for ans in attempt_data.get("answers", []):
+            storage.save_answer(
+                attempt_id=attempt_data["id"],
+                question_id=ans["question_id"],
+                selected_answer=ans.get("selected_answer"),
+                correct_answer=ans["correct_answer"],
+                status=ans["status"],
+            )
+            # Update answered_at timestamp
+            with storage._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE answers SET answered_at = %s WHERE attempt_id = %s AND question_id = %s",
+                        (ans.get("answered_at"), attempt_data["id"], ans["question_id"]),
+                    )
+
+        imported += 1
+
+    return imported
+
 
 def render_intro():
     st.title(f"📚 {PAGE_TITLE}")
@@ -930,6 +1259,8 @@ def render_intro():
         "✅ Answers are revealed instantly after each submission."
         if st.session_state.mode_choice == MODE_PRACTICE
         else "🔒 Answers are revealed only after the full test is submitted."
+        if st.session_state.mode_choice == MODE_TEST
+        else "🎯 Topic-based simulation test with mixed questions from selected subjects."
     )
 
     st.markdown(
